@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pompes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0f14">
+<title>Compteur de pompes</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;margin:0;background:#0b0f14;color:#fff;font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
+  body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0px)}
+  #stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
+  #v,#c{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;transform:scaleX(-1)}
+  #count{position:absolute;top:8px;left:0;right:0;text-align:center;font-size:26vmin;font-weight:800;line-height:1;text-shadow:0 4px 24px rgba(0,0,0,.8);pointer-events:none}
+  #msg{position:absolute;left:12px;right:12px;bottom:12px;text-align:center;font-size:15px;padding:10px 12px;border-radius:12px;background:rgba(11,15,20,.72)}
+  #bar{display:flex;gap:10px;align-items:center;padding:12px 14px calc(12px + env(safe-area-inset-bottom,0px))}
+  button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:14px 18px;color:#fff;background:#1f2a37}
+  #go{flex:1;background:#16a34a;font-size:17px}
+  #go.on{background:#dc2626}
+  button:disabled{opacity:.5}
+  label{font-size:14px;display:flex;gap:6px;align-items:center;color:#cbd5e1}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="v" playsinline muted></video>
+  <canvas id="c"></canvas>
+  <div id="count">0</div>
+  <div id="msg">Pose ton iPhone au sol, de profil par rapport à toi, puis appuie sur Démarrer.</div>
+</div>
+<div id="bar">
+  <button id="reset">Zéro</button>
+  <button id="go">Démarrer</button>
+  <label><input type="checkbox" id="voice" checked>Voix</label>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const UP = 150;    // angle du coude (°) considéré comme "bras tendus"
+const DOWN = 105;  // angle du coude (°) considéré comme "en bas"
+
+const $ = id => document.getElementById(id);
+const video = $("v"), cv = $("c"), ctx = cv.getContext("2d");
+const goBtn = $("go"), msgEl = $("msg"), countEl = $("count");
+let landmarker, stream, running = false, count = 0, phase = "ready", lastRep = 0, ang = null, lastT = -1, audio, wake;
+
+const setMsg = t => { if (msgEl.textContent !== t) msgEl.textContent = t; };
+
+function angle(a, b, c) {
+  const v1 = { x: a.x - b.x, y: a.y - b.y }, v2 = { x: c.x - b.x, y: c.y - b.y };
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const m = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y);
+  return m ? Math.acos(Math.max(-1, Math.min(1, dot / m))) * 180 / Math.PI : 180;
+}
+
+function beep() {
+  try {
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.frequency.value = 880; g.gain.value = 0.15;
+    o.connect(g); g.connect(audio.destination);
+    o.start(); o.stop(audio.currentTime + 0.12);
+  } catch (e) {}
+}
+
+function feedback() {
+  countEl.textContent = count;
+  beep();
+  if ($("voice").checked && "speechSynthesis" in window) {
+    const u = new SpeechSynthesisUtterance(String(count));
+    u.lang = "fr-FR";
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  }
+}
+
+function handle(lm) {
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!lm) { setMsg("Je ne te vois pas : mets-toi entièrement dans le cadre, de profil."); return; }
+
+  // On choisit le côté du corps (gauche/droite) le mieux visible
+  const sides = [[11, 13, 15, 23], [12, 14, 16, 24]];
+  let best = null, bv = 0;
+  for (const s of sides) {
+    const v = Math.min(...s.map(i => lm[i].visibility ?? 0));
+    if (v > bv) { bv = v; best = s; }
+  }
+  if (!best || bv < 0.5) { setMsg("Bras mal visibles : recule un peu ou change l'angle."); return; }
+
+  const [sh, el, wr, hp] = best.map(i => ({ x: lm[i].x * W, y: lm[i].y * H }));
+
+  // Dessin du bras suivi
+  ctx.lineWidth = 6; ctx.strokeStyle = "#22c55e"; ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.moveTo(hp.x, hp.y); ctx.lineTo(sh.x, sh.y); ctx.lineTo(el.x, el.y); ctx.lineTo(wr.x, wr.y); ctx.stroke();
+  for (const p of [sh, el, wr, hp]) { ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, 7); ctx.fill(); }
+
+  // Position de pompe : épaule-hanche plutôt horizontale
+  const horizontal = Math.abs(sh.x - hp.x) > Math.abs(sh.y - hp.y);
+  if (!horizontal) { phase = "ready"; setMsg("Mets-toi en position de pompe, de profil par rapport à la caméra."); return; }
+
+  const a = angle(sh, el, wr);
+  ang = ang == null ? a : ang * 0.6 + a * 0.4;
+  const now = performance.now();
+
+  if (phase === "ready") {
+    if (ang > UP) { phase = "up"; }
+    setMsg("Tends les bras pour commencer.");
+  } else if (phase === "up") {
+    setMsg("Descends…");
+    if (ang < DOWN) phase = "down";
+  } else if (phase === "down") {
+    setMsg("Remonte !");
+    if (ang > UP) {
+      phase = "up";
+      if (now - lastRep > 500) { count++; lastRep = now; feedback(); }
+    }
+  }
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    try { handle(landmarker.detectForVideo(video, performance.now()).landmarks[0]); } catch (e) {}
+  }
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  goBtn.disabled = true;
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === "suspended") await audio.resume();
+    if ("speechSynthesis" in window) speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+
+    setMsg("Autorise la caméra…");
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+
+    if (!landmarker) {
+      setMsg("Chargement du modèle (quelques secondes)…");
+      const fileset = await FilesetResolver.forVisionTasks(BASE);
+      const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: "VIDEO", numPoses: 1 });
+      try { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
+      catch (e) { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
+    }
+    try { wake = await navigator.wakeLock?.request("screen"); } catch (e) {}
+
+    running = true; phase = "ready"; ang = null;
+    goBtn.textContent = "Arrêter"; goBtn.classList.add("on");
+    loop();
+  } catch (e) {
+    setMsg("Erreur : " + (e.message || e) + " (la page doit être ouverte en https et la caméra autorisée).");
+  }
+  goBtn.disabled = false;
+}
+
+function stop() {
+  running = false;
+  stream?.getTracks().forEach(t => t.stop());
+  try { wake?.release(); } catch (e) {}
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  goBtn.textContent = "Démarrer"; goBtn.classList.remove("on");
+  setMsg(`Terminé : ${count} pompe${count > 1 ? "s" : ""}.`);
+}
+
+goBtn.onclick = () => running ? stop() : start();
+$("reset").onclick = () => { count = 0; countEl.textContent = 0; phase = "ready"; };
+</script>
+</body>
+</html>
